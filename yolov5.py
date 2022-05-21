@@ -12,6 +12,7 @@ from utils.augmentations import letterbox
 from utils.general import non_max_suppression, scale_coords
 from utils.plots import Annotator, colors
 from utils.torch_utils import select_device, time_sync
+import matplotlib.pyplot as plt
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -22,9 +23,9 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 CONFIG_PATH = 'config/'
 WEIGHTS_PATH = 'yolov5s.pt'
 NAMES_PATH = CONFIG_PATH + 'coco.names'
-DEVICE = "gpu"
+DEVICE = "cpu"
 CFG_PATH = CONFIG_PATH + 'yolor_p6.cfg'
-IMAGE_SIZE = 1280
+IMAGE_SIZE = 640
 
 
 class ObjectDetection:
@@ -32,7 +33,7 @@ class ObjectDetection:
     def __init__(self,
                  weights=WEIGHTS_PATH,
                  data=ROOT / 'data/coco128.yaml',  # dataset
-                 device="gpu",
+                 device=DEVICE,
                  half=False,
                  hide_labels=False,
                  hide_conf=False,
@@ -40,11 +41,16 @@ class ObjectDetection:
                  ):
         self.device = select_device(device)
 
-        model = DetectMultiBackend(weights, device=device, dnn=False, data=data, fp16=half)
+        model = DetectMultiBackend(weights, device=self.device, dnn=False, data=data, fp16=half)
+
+        stride, names, pt = model.stride, model.names, model.pt
         self.model = model
         self.hide_labels = hide_labels
         self.hide_conf = hide_conf
-        self.names = self.load_classes(NAMES_PATH)
+        self.names = names
+        self.img_size = IMAGE_SIZE
+        self.stride = stride
+        self.pt = pt
 
     def load_classes(self, path):
         # Loads *.names file at 'path'
@@ -54,13 +60,13 @@ class ObjectDetection:
         return list(filter(None, names))
 
     def detect(self, input_image):
+        print('orignal shape', input_image.shape)
         bbox_list = []
 
-        input_image = self.preprocess(input_image)
+        im = self.preprocess(input_image)
+        print(im.shape)
 
-        img = letterbox(input_image, new_shape=IMAGE_SIZE, auto_size=64)[0]
-
-        print("recieving image with shape {}".format(img.shape))
+        print("recieving image with shape {}".format(im.shape))
 
         dt, seen = [0.0, 0.0, 0.0], 0
         t1 = time_sync()
@@ -80,21 +86,21 @@ class ObjectDetection:
 
         # NMS
         pred = non_max_suppression(pred, conf_thres=0.25, iou_thres=0.45,
-                                   classes=None, agnostic_nms=False, max_det=1000)
+                                   classes=None, agnostic=False, max_det=1000)
         dt[2] += time_sync() - t3
-
         # Process predictions
         for i, det in enumerate(pred):  # per image
 
+            annotator = Annotator(input_image, line_width=3, example=str(self.names))
+            # s += '%gx%g ' % im.shape[2:]
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(
-                    img.shape[2:], det[:, :4], input_image.shape).round()
-
+                    im.shape[2:], det[:, :4], input_image.shape).round()
                 # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                # for c in det[:, -1].unique():
+                #     n = (det[:, -1] == c).sum()  # detections per class
+                #     s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
@@ -102,7 +108,58 @@ class ObjectDetection:
                     c = int(cls)  # integer class
                     label = None if self.hide_labels else (
                         self.names[c] if self.hide_conf else f'{self.names[c]} {conf:.2f}')
-                    Annotator.box_label(xyxy, label, color=colors(c, True))
+                    annotator.box_label(xyxy, label, color=colors(c, True))
+
+        return input_image
+
+    def preprocess(self, img):
+        img = letterbox(img, new_shape=self.img_size, stride=self.stride, auto=self.pt)[0]
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
+        return img
+
+    def get_bbox(self, input_image):
+        print('orignal shape', input_image.shape)
+        bbox_list = []
+
+        im = self.preprocess(input_image)
+        print(im.shape)
+
+        print("recieving image with shape {}".format(im.shape))
+
+        dt, seen = [0.0, 0.0, 0.0], 0
+        t1 = time_sync()
+        im = torch.from_numpy(im).to(self.device)
+        im = im.half() if self.model.fp16 else im.float()  # uint8 to fp16/32
+        im /= 255  # 0 - 255 to 0.0 - 1.0
+        if len(im.shape) == 3:
+            im = im[None]  # expand for batch dim
+        t2 = time_sync()
+        dt[0] += t2 - t1
+
+        # Inference
+        print("Inferencing ...")
+        pred = self.model(im)
+        t3 = time_sync()
+        dt[1] += t3 - t2
+
+        # NMS
+        pred = non_max_suppression(pred, conf_thres=0.25, iou_thres=0.45,
+                                   classes=None, agnostic=False, max_det=1000)
+        dt[2] += time_sync() - t3
+
+        # Process predictions
+        for i, det in enumerate(pred):  # per image
+
+            # s += '%gx%g ' % im.shape[2:]
+            if det is not None and len(det):
+                # Rescale boxes from img_size to im0 size
+                det[:, :4] = scale_coords(
+                    im.shape[2:], det[:, :4], input_image.shape).round()
+                # Print results
+                # for c in det[:, -1].unique():
+                #     n = (det[:, -1] == c).sum()  # detections per class
+                #     s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 for *xyxy, conf, cls in det:
                     temp = []
@@ -111,24 +168,25 @@ class ObjectDetection:
                     bbox = list(np.array(temp).astype(int))
                     bbox.append(self.names[int(cls)])
                     bbox_list.append(bbox)
-        return input_image, bbox_list
-
-    def preprocess(self, img):
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
-        return img
+        return bbox_list
 
 
 def main():
 
-    HOST = socket.gethostname()
-    PORT = 10001
+    # HOST = socket.gethostname()
+    # PORT = 10001
 
     OD = ObjectDetection()
     img = cv2.imread('D:\sup_mine\cv-robocup\yolov5\data\images\zidane.jpg')
-    res_img, bbox_list = OD.detect(img)
-    print(bbox_list)
-    print(res_img)
+
+    # inference
+    with torch.no_grad():
+        res_img = OD.detect(img)
+        bbox_list = OD.get_bbox(img)
+        print(bbox_list)
+    # cv2.imwrite('./test_img.png', res_img)
+    # plt.show()
+    # print(res_img)
     # while True:
     #     conn, addr = server.sock.accept()
     #     print("Client connected from", addr)
